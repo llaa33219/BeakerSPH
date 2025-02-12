@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SPH Fluid Simulation Sandbox</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #canvas { display: block; }
+    #toolbar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      color: white;
+      font-family: sans-serif;
+      background: rgba(0,0,0,0.5);
+      padding: 5px;
+      border-radius: 4px;
+    }
+    button, select, input { margin: 2px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="toolbar">
+    Fluid Type:
+    <select id="fluidSelect"></select>
+    <br>
+    Beaker Width:
+    <input type="range" id="beakerWidthInput" min="100" max="600" value="300">
+    <span id="beakerWidthValue">300</span>
+    <br>
+    Beaker Height:
+    <input type="range" id="beakerHeightInput" min="100" max="600" value="300">
+    <span id="beakerHeightValue">300</span>
+    <br>
+    <!-- (추가) 시뮬레이션 속도 조절 UI -->
+    Simulation Speed:
+    <input type="range" id="simSpeedInput" min="0.1" max="2.0" step="0.1" value="1.0">
+    <span id="simSpeedValue">1.0</span>
+  </div>
+  <script>
+    // 캔버스 및 컨텍스트 설정
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // 시뮬레이션 파라미터 (안정화 세팅)
+    // --- (수정) 시간 간격을 조금 더 줄여서 안정화 ---
+    const dt = 0.002; // 기존 0.003 → 0.002
+
+    const gravity = { x: 0, y: 500 }; // 중력 가속도
+
+    // 입자 반경(기존 그대로 10 유지)
+    const particleRadius = 10;
+    const collisionDistance = 2 * particleRadius; // 20
+
+    // 충돌 및 상호작용 관련 계수 (일부 값 수정)
+    // --- (수정) contactStiffness 값 축소 ---
+    const contactStiffness = 3000; // 기존 6000 → 3000
+
+    // --- (수정) 상호작용 배율(interactionMultiplier) 축소 ---
+    const interactionMultiplier = 1.5; // 기존 2.0 → 1.5
+
+    // --- (수정) 경계(바운더리) 강성 축소 ---
+    const boundaryStiffness = 1000; // 기존 1500 → 1000
+
+    // 스무딩 길이 (기존 그대로)
+    const h = 20;
+    const h2 = h * h;
+
+    // SPH 커널 상수 (h=20)
+    const poly6Coeff = 315 / (64 * Math.PI * Math.pow(h, 9));
+    const spikyCoeff = -45 / (Math.PI * Math.pow(h, 6));
+    const viscCoeff = 45 / (Math.PI * Math.pow(h, 6));
+
+    // 다른 유체 간 상호작용 계수 (값 상향)
+    const differentFluidPressureMultiplier = 3.0;  // 기존 1.5 → 3.0
+    const differentFluidViscosityMultiplier = 1.0; // 기존 0.5 → 1.0
+
+    // (추가) 표면장력 계산 시 스케일링(단위 보정)
+    const surfaceTensionScaling = 0.0001;
+
+    // 다양한 유체 타입 정의(일부 값 조정 및 surfaceTension 추가)
+    // mass는 기존 1로 두되, 실제 사용은 restDensity 기반으로 하도록 변경
+    const fluidTypes = [
+    {
+        name: "Water",
+        restDensity: 1000,
+        stiffness: 2000,
+        viscosity: 250,
+        color: "#3399FF",
+        mass: 1,
+        // (추가) 실제 물 표면장력 (약 0.0728 N/m), 조금 축소 적용
+        surfaceTension: 0.0728
+      },
+      {
+        name: "Oil",
+        restDensity: 900,
+        stiffness: 1800,
+        viscosity: 300,
+        color: "#FFCC66",
+        mass: 1,
+        // (추가) 오일 표면장력 (물보다 낮게)
+        surfaceTension: 0.030
+      },
+      {
+        name: "Honey",
+        restDensity: 1400,
+        stiffness: 3000,
+        viscosity: 600,
+        color: "#FF9900",
+        mass: 1,
+        // (추가) 꿀의 표면장력
+        surfaceTension: 0.065
+      },
+      {
+        name: "Lava",
+        restDensity: 3100,
+        stiffness: 5000,
+        viscosity: 100,
+        color: "#FF3300",
+        mass: 1,
+        // (추가) 용암(화산용암) 표면장력 가정
+        surfaceTension: 0.100
+      },
+      {
+        name: "Acid",
+        restDensity: 1200,
+        stiffness: 2500,
+        viscosity: 200,
+        color: "#66FF66",
+        mass: 1,
+        // (추가) 산성 액체 표면장력 가정
+        surfaceTension: 0.070
+      },
+      {
+        name: "Mercury",
+        restDensity: 13500,
+        stiffness: 8000,
+        viscosity: 50,
+        color: "#BBBBBB",
+        mass: 1,
+        // (추가) 수은 표면장력 (물보다 훨씬 큼)
+        surfaceTension: 0.48
+      },
+      {
+        name: "Milk",
+        restDensity: 1030,
+        stiffness: 2100,
+        viscosity: 280,
+        color: "#FFFFFF",
+        mass: 1,
+        // (추가) 우유의 표면장력 (물과 비슷하지만 약간 낮음)
+        surfaceTension: 0.055
+      },
+      {
+        name: "Blood",
+        restDensity: 1060,
+        stiffness: 2200,
+        viscosity: 500,
+        color: "#990000",
+        mass: 1,
+        // (추가) 혈액 표면장력 (물보다 약간 낮은 편)
+        surfaceTension: 0.058
+      },
+      {
+        name: "Alcohol",
+        restDensity: 790,
+        stiffness: 1500,
+        viscosity: 120,
+        color: "#CCFFFF",
+        mass: 1,
+        // (추가) 에탄올 표면장력
+        surfaceTension: 0.022
+      },
+      {
+        name: "Liquid Nitrogen",
+        restDensity: 800,
+        stiffness: 1000,
+        viscosity: 160,
+        color: "#99CCFF",
+        mass: 1,
+        // (추가) 액체 질소 표면장력
+        surfaceTension: 0.009
+      },
+      {
+        name: "Soap Water",
+        restDensity: 1000,
+        stiffness: 1900,
+        viscosity: 300,
+        color: "#99FF99",
+        mass: 1,
+        // (추가) 비눗물 표면장력 (물보다 낮음)
+        surfaceTension: 0.025
+      },
+      {
+        name: "Sea Water",
+        restDensity: 1025,
+        stiffness: 2100,
+        viscosity: 260,
+        color: "#66CCFF",
+        mass: 1,
+        // (추가) 바닷물 표면장력 (물과 비슷하거나 약간 높음)
+        surfaceTension: 0.074
+      },
+      {
+        name: "Molten Steel",
+        restDensity: 7800,
+        stiffness: 10000,
+        viscosity: 1000,
+        color: "#666666",
+        mass: 1,
+        // (추가) 용융강 표면장력 (가정)
+        surfaceTension: 1.8
+      },
+      {
+        name: "Molten Glass",
+        restDensity: 2200,
+        stiffness: 6000,
+        viscosity: 2000,
+        color: "#FF6600",
+        mass: 1,
+        // (추가) 용융유리 표면장력 (가정)
+        surfaceTension: 0.30
+      },
+      {
+        name: "Liquid Helium",
+        restDensity: 125,
+        stiffness: 500,
+        viscosity: 1,
+        color: "#FFFFCC",
+        mass: 1,
+        // (추가) 액체 헬륨 표면장력 (초유체 수준으로 매우 낮음)
+        surfaceTension: 0.00036
+      },
+      // ------------------ 여기서부터 새로 추가된 30개 ------------------
+      {
+        name: "Molten Aluminum",
+        restDensity: 2375,
+        stiffness: 7000,
+        viscosity: 2,
+        color: "#BFBFBF",
+        mass: 1,
+        // (추가) 용융 알루미늄 표면장력 (가정)
+        surfaceTension: 0.90
+      },
+      {
+        name: "Molten Copper",
+        restDensity: 8000,
+        stiffness: 9000,
+        viscosity: 4,
+        color: "#CC6600",
+        mass: 1,
+        // (추가) 용융 구리 표면장력 (가정)
+        surfaceTension: 1.30
+      },
+      {
+        name: "Liquid Ammonia",
+        restDensity: 681,
+        stiffness: 1200,
+        viscosity: 80,
+        color: "#99CCFF",
+        mass: 1,
+        // (추가) 액화 암모니아 표면장력 (가정)
+        surfaceTension: 0.020
+      },
+      {
+        name: "Milkshake",
+        restDensity: 1030,
+        stiffness: 2000,
+        viscosity: 800,
+        color: "#FFE6CC",
+        mass: 1,
+        // (추가) 밀크셰이크 표면장력 (가정)
+        surfaceTension: 0.050
+      },
+      {
+        name: "Liquid Oxygen",
+        restDensity: 1141,
+        stiffness: 1000,
+        viscosity: 200,
+        color: "#99FFFF",
+        mass: 1,
+        // (추가) 액체 산소 표면장력
+        surfaceTension: 0.013
+      },
+      {
+        name: "Liquid Argon",
+        restDensity: 1390,
+        stiffness: 1000,
+        viscosity: 200,
+        color: "#CCFFFF",
+        mass: 1,
+        // (추가) 액체 아르곤 표면장력 (가정)
+        surfaceTension: 0.020
+      },
+      {
+        name: "Liquid Krypton",
+        restDensity: 2410,
+        stiffness: 1000,
+        viscosity: 200,
+        color: "#CCFFCC",
+        mass: 1,
+        // (추가) 액체 크립톤 표면장력 (가정)
+        surfaceTension: 0.030
+      },
+      {
+        name: "Glycerin",
+        restDensity: 1261,
+        stiffness: 2000,
+        viscosity: 950,
+        color: "#FFFF99",
+        mass: 1,
+        // (추가) 글리세린 표면장력
+        surfaceTension: 0.063
+      },
+      {
+        name: "Maple Syrup",
+        restDensity: 1330,
+        stiffness: 2200,
+        viscosity: 1400,
+        color: "#CC6600",
+        mass: 1,
+        // (추가) 메이플 시럽 표면장력 (가정)
+        surfaceTension: 0.065
+      },
+      {
+        name: "Tar",
+        restDensity: 1200,
+        stiffness: 3000,
+        viscosity: 5000,
+        color: "#333333",
+        mass: 1,
+        // (추가) 타르 표면장력 (가정)
+        surfaceTension: 0.070
+      },
+      {
+        name: "Latex",
+        restDensity: 950,
+        stiffness: 1500,
+        viscosity: 400,
+        color: "#FFFFCC",
+        mass: 1,
+        // (추가) 라텍스 표면장력 (가정)
+        surfaceTension: 0.035
+      },
+      {
+        name: "Liquid Sulfur",
+        restDensity: 1800,
+        stiffness: 3500,
+        viscosity: 150,
+        color: "#FFFF66",
+        mass: 1,
+        // (추가) 액체 황 표면장력 (가정)
+        surfaceTension: 0.075
+      },
+      {
+        name: "Molten Lead",
+        restDensity: 10670,
+        stiffness: 8500,
+        viscosity: 4,
+        color: "#999999",
+        mass: 1,
+        // (추가) 용융 납 표면장력
+        surfaceTension: 0.435
+      },
+      {
+        name: "Molten Gold",
+        restDensity: 17300,
+        stiffness: 11000,
+        viscosity: 6,
+        color: "#FFD700",
+        mass: 1,
+        // (추가) 용융 금 표면장력 (가정)
+        surfaceTension: 1.15
+      },
+      {
+        name: "Molten Silver",
+        restDensity: 9300,
+        stiffness: 9000,
+        viscosity: 4,
+        color: "#C0C0C0",
+        mass: 1,
+        // (추가) 용융 은 표면장력 (가정)
+        surfaceTension: 0.90
+      },
+      {
+        name: "Liquid Sodium",
+        restDensity: 927,
+        stiffness: 4000,
+        viscosity: 3,
+        color: "#DCDCAA",
+        mass: 1,
+        // (추가) 액체 나트륨 표면장력 (가정)
+        surfaceTension: 0.20
+      },
+      {
+        name: "Liquid Potassium",
+        restDensity: 828,
+        stiffness: 3900,
+        viscosity: 3,
+        color: "#DCE2AA",
+        mass: 1,
+        // (추가) 액체 칼륨 표면장력 (가정)
+        surfaceTension: 0.21
+      },
+      {
+        name: "Liquid Gallium",
+        restDensity: 6095,
+        stiffness: 6000,
+        viscosity: 2,
+        color: "#E6E6E6",
+        mass: 1,
+        // (추가) 액체 갈륨 표면장력
+        surfaceTension: 0.71
+      },
+      {
+        name: "Liquid Bromine",
+        restDensity: 3119,
+        stiffness: 3000,
+        viscosity: 120,
+        color: "#A52A2A",
+        mass: 1,
+        // (추가) 액체 브로민 표면장력
+        surfaceTension: 0.04
+      },
+      {
+        name: "Molten Wax",
+        restDensity: 900,
+        stiffness: 1500,
+        viscosity: 100,
+        color: "#FFF8DC",
+        mass: 1,
+        // (추가) 용융 왁스 표면장력 (가정)
+        surfaceTension: 0.03
+      },
+      {
+        name: "Liquid Neon",
+        restDensity: 1207,
+        stiffness: 1000,
+        viscosity: 180,
+        color: "#FFCCCC",
+        mass: 1,
+        // (추가) 액체 네온 표면장력 (가정)
+        surfaceTension: 0.008
+      },
+      {
+        name: "Liquid Chlorine",
+        restDensity: 1562,
+        stiffness: 1200,
+        viscosity: 150,
+        color: "#99FF33",
+        mass: 1,
+        // (추가) 액체 염소 표면장력 (가정)
+        surfaceTension: 0.012
+      },
+      {
+        name: "Liquid Butane",
+        restDensity: 601,
+        stiffness: 900,
+        viscosity: 50,
+        color: "#FFB266",
+        mass: 1,
+        // (추가) 액체 부탄 표면장력 (가정)
+        surfaceTension: 0.013
+      },
+      {
+        name: "Liquid Propane",
+        restDensity: 493,
+        stiffness: 800,
+        viscosity: 40,
+        color: "#FFCC99",
+        mass: 1,
+        // (추가) 액체 프로판 표면장력 (가정)
+        surfaceTension: 0.015
+      },
+      {
+        name: "Liquid Hydrogen",
+        restDensity: 71,
+        stiffness: 500,
+        viscosity: 10,
+        color: "#D6FFFF",
+        mass: 1,
+        // (추가) 액체 수소 표면장력
+        surfaceTension: 0.0019
+      },
+      {
+        name: "Isopropanol",
+        restDensity: 785,
+        stiffness: 1500,
+        viscosity: 200,
+        color: "#CCFFEE",
+        mass: 1,
+        // (추가) 아이소프로판올 표면장력 (가정)
+        surfaceTension: 0.021
+      },
+      {
+        name: "Acetone",
+        restDensity: 784,
+        stiffness: 1400,
+        viscosity: 30,
+        color: "#E6FFFA",
+        mass: 1,
+        // (추가) 아세톤 표면장력
+        surfaceTension: 0.023
+      },
+      {
+        name: "Liquid Fluorine",
+        restDensity: 1500,
+        stiffness: 1800,
+        viscosity: 50,
+        color: "#CCFF66",
+        mass: 1,
+        // (추가) 액체 플루오린 표면장력 (가정)
+        surfaceTension: 0.015
+      },
+      {
+        name: "Liquid Methane",
+        restDensity: 422,
+        stiffness: 700,
+        viscosity: 30,
+        color: "#CCFFFF",
+        mass: 1,
+        // (추가) 액체 메테인 표면장력 (가정)
+        surfaceTension: 0.017
+      },
+      {
+        name: "Supercritical CO2",
+        restDensity: 468,
+        stiffness: 3000,
+        viscosity: 60,
+        color: "#66FFFF",
+        mass: 1,
+        // (추가) 초임계 이산화탄소 (표면장력 거의 0)
+        surfaceTension: 0
+      },
+    ];
+
+    // Fluid Type 드롭다운 구성
+    const fluidSelect = document.getElementById("fluidSelect");
+    fluidTypes.forEach((fluid, index) => {
+      const option = document.createElement("option");
+      option.value = index;
+      option.textContent = fluid.name;
+      fluidSelect.appendChild(option);
+    });
+
+    // 비커 변수 설정 (기본값)
+    let beakerWidth = 300;
+    let beakerHeight = 300;
+
+    // UI 요소와 이벤트 리스너 (비커 크기 조절)
+    const beakerWidthInput = document.getElementById("beakerWidthInput");
+    const beakerHeightInput = document.getElementById("beakerHeightInput");
+    const beakerWidthValue = document.getElementById("beakerWidthValue");
+    const beakerHeightValue = document.getElementById("beakerHeightValue");
+
+    beakerWidthInput.addEventListener("input", () => {
+      beakerWidth = parseInt(beakerWidthInput.value);
+      beakerWidthValue.textContent = beakerWidth;
+    });
+    beakerHeightInput.addEventListener("input", () => {
+      beakerHeight = parseInt(beakerHeightInput.value);
+      beakerHeightValue.textContent = beakerHeight;
+    });
+
+    // (추가) 시뮬레이션 속도 변수
+    let simulationSpeed = 1.0;
+    const simSpeedInput = document.getElementById("simSpeedInput");
+    const simSpeedValue = document.getElementById("simSpeedValue");
+    simSpeedInput.addEventListener("input", () => {
+      simulationSpeed = parseFloat(simSpeedInput.value);
+      simSpeedValue.textContent = simulationSpeed;
+    });
+
+    // 입자 클래스
+    class Particle {
+      constructor(x, y, fluidTypeIndex) {
+        this.x = x;
+        this.y = y;
+        this.vx = 0;
+        this.vy = 0;
+        this.ax = 0;
+        this.ay = 0;
+        this.density = 0;
+        this.pressure = 0;
+        this.fluid = fluidTypes[fluidTypeIndex];
+        // (수정) fluid.restDensity 기반으로 실제 질량 설정
+        this.mass = this.fluid.restDensity * 0.0002;
+        this.color = this.fluid.color;
+        // -- 비커 밖으로 나갔는지 추적
+        this.outsideBeaker = false;
+      }
+    }
+
+    // 시뮬레이션 내 입자 배열
+    let particles = [];
+
+    // SPH 커널 함수들
+    function poly6Kernel(r) {
+      if (r >= 0 && r <= h) {
+        return poly6Coeff * Math.pow((h * h - r * r), 3);
+      }
+      return 0;
+    }
+
+    function spikyKernelGradient(r) {
+      if (r > 0 && r <= h) {
+        return spikyCoeff * Math.pow((h - r), 2);
+      }
+      return 0;
+    }
+
+    function viscosityKernelLaplacian(r) {
+      if (r >= 0 && r <= h) {
+        return viscCoeff * (h - r);
+      }
+      return 0;
+    }
+
+    // 공간 분할 (그리드) 함수
+    function buildGrid(particles, cellSize) {
+      const grid = new Map();
+      for (let p of particles) {
+        let cellX = Math.floor(p.x / cellSize);
+        let cellY = Math.floor(p.y / cellSize);
+        let key = cellX + "," + cellY;
+        if (!grid.has(key)) {
+          grid.set(key, []);
+        }
+        grid.get(key).push(p);
+      }
+      return grid;
+    }
+
+    // 추가: 한 번만 이웃(Neighbors) 계산해서 재활용
+    function computeNeighbors(particles, grid) {
+      const neighborLists = new Array(particles.length);
+      for (let i = 0; i < particles.length; i++) {
+        neighborLists[i] = [];
+      }
+      for (let i = 0; i < particles.length; i++) {
+        let p = particles[i];
+        let cellX = Math.floor(p.x / h);
+        let cellY = Math.floor(p.y / h);
+
+        // 주변 9개 셀 탐색
+        for (let cx = cellX - 1; cx <= cellX + 1; cx++) {
+          for (let cy = cellY - 1; cy <= cellY + 1; cy++) {
+            let key = cx + "," + cy;
+            if (grid.has(key)) {
+              let cellParticles = grid.get(key);
+              for (let q of cellParticles) {
+                if (p !== q) {
+                  neighborLists[i].push(q);
+                }
+              }
+            }
+          }
+        }
+      }
+      return neighborLists;
+    }
+
+    // 시뮬레이션 업데이트 함수
+    function update() {
+      // (추가) 현재 시뮬레이션 속도를 적용한 dt
+      let currentDt = dt * simulationSpeed;
+
+      // 1) 그리드 생성
+      const grid = buildGrid(particles, h);
+
+      // 2) 각 입자의 이웃을 한 번만 계산
+      const neighborLists = computeNeighbors(particles, grid);
+
+      // 3) 밀도와 압력 계산
+      for (let i = 0; i < particles.length; i++) {
+        let p = particles[i];
+        p.density = 0;
+
+        const neighbors = neighborLists[i];
+        for (let j = 0; j < neighbors.length; j++) {
+          let q = neighbors[j];
+          let dx = p.x - q.x;
+          let dy = p.y - q.y;
+          let r2 = dx * dx + dy * dy;
+          if (r2 < h2) {
+            let r = Math.sqrt(r2);
+            p.density += q.mass * poly6Kernel(r);
+          }
+        }
+
+        // 최소 밀도 값 보장
+        if (p.density < p.fluid.restDensity) {
+          p.density = p.fluid.restDensity;
+        }
+        p.pressure = p.fluid.stiffness * (p.density - p.fluid.restDensity);
+      }
+
+      // 4) 압력/점성/충돌 + 표면장력 힘 계산 + 오일러 적분
+      for (let i = 0; i < particles.length; i++) {
+        let p = particles[i];
+        let pressureForceX = 0;
+        let pressureForceY = 0;
+        let viscosityForceX = 0;
+        let viscosityForceY = 0;
+        // (추가) 표면장력 힘
+        let surfaceTensionForceX = 0;
+        let surfaceTensionForceY = 0;
+
+        const neighbors = neighborLists[i];
+        for (let j = 0; j < neighbors.length; j++) {
+          let q = neighbors[j];
+          let dx = p.x - q.x;
+          let dy = p.y - q.y;
+          let r2 = dx * dx + dy * dy;
+          if (r2 < h2) {
+            let r = Math.sqrt(r2);
+
+            // 압력 힘
+            let grad = spikyKernelGradient(r);
+            if (q.density > 0 && r > 0) {
+              let common = (p.pressure + q.pressure) / (2 * q.density);
+              let factor = q.mass * common * grad;
+              let pressureMult = (p.fluid === q.fluid) ? 1.0 : differentFluidPressureMultiplier;
+              pressureForceX += -pressureMult * factor * (dx / r);
+              pressureForceY += -pressureMult * factor * (dy / r);
+            }
+
+            // 점성 힘
+            let laplacian = viscosityKernelLaplacian(r);
+            let avgViscosity = (p.fluid.viscosity + q.fluid.viscosity) / 2;
+            let viscosityMult = (p.fluid === q.fluid) ? 1.0 : differentFluidViscosityMultiplier;
+            viscosityForceX += viscosityMult * avgViscosity * q.mass * ((q.vx - p.vx) / (q.density + 1e-6)) * laplacian;
+            viscosityForceY += viscosityMult * avgViscosity * q.mass * ((q.vy - p.vy) / (q.density + 1e-6)) * laplacian;
+
+            // 충돌 반발력
+            if (r < collisionDistance && r > 0) {
+              let penetration = collisionDistance - r;
+              let extraMultiplier = (r < collisionDistance * 0.5) ? 2.0 : 1.0;
+              let repulsiveForce = contactStiffness * penetration * extraMultiplier;
+              let collisionMult = (p.fluid === q.fluid) ? 1.0 : differentFluidPressureMultiplier;
+              pressureForceX += collisionMult * repulsiveForce * (dx / r);
+              pressureForceY += collisionMult * repulsiveForce * (dy / r);
+            }
+
+            // (추가) 표면장력(간단 Cohesion 모델) 계산
+            if (r > 0 && r < h) {
+              let avgSurfaceTension = (p.fluid.surfaceTension + q.fluid.surfaceTension) * 0.5;
+              let stVal = surfaceTensionScaling * avgSurfaceTension * spikyKernelGradient(r);
+              surfaceTensionForceX += -stVal * (dx / r);
+              surfaceTensionForceY += -stVal * (dy / r);
+            }
+          }
+        }
+
+        // (중요 수정) 중력 적용 방식을 원본과 유사하게 변경
+        // 1) 압력/점성/표면장력 등 내부 힘 합
+        let totalForceX = interactionMultiplier * pressureForceX + viscosityForceX + surfaceTensionForceX;
+        let totalForceY = interactionMultiplier * pressureForceY + viscosityForceY + surfaceTensionForceY;
+
+        // 2) 내부 힘을 밀도로 나눈 뒤, 중력.y를 직접 더함
+        p.ax = totalForceX / p.density;
+        p.ay = (totalForceY / p.density) + gravity.y;
+
+        // 오일러 적분(속도, 위치 업데이트)
+        p.vx += p.ax * currentDt;
+        p.vy += p.ay * currentDt;
+        p.x += p.vx * currentDt;
+        p.y += p.vy * currentDt;
+
+        // 캔버스 경계 충돌 처리
+        if (p.x < particleRadius) {
+          p.x = particleRadius;
+          p.vx *= -0.5;
+        }
+        if (p.x > canvas.width - particleRadius) {
+          p.x = canvas.width - particleRadius;
+          p.vx *= -0.5;
+        }
+        if (p.y < particleRadius) {
+          p.y = particleRadius;
+          p.vy *= -0.5;
+        }
+        if (p.y > canvas.height - particleRadius) {
+          let penetration = p.y - (canvas.height - particleRadius);
+          let boundaryDamping = 50;
+          let correction = -boundaryStiffness * penetration - boundaryDamping * p.vy;
+          p.vy += correction * currentDt;
+          p.vx *= 0.95;
+          p.y = canvas.height - particleRadius + penetration * 0.5;
+        }
+
+        // ----- 비커 충돌 처리 (outsideBeaker가 false일 때만) -----
+        let bLeft = canvas.width / 2 - beakerWidth / 2;
+        let bRight = canvas.width / 2 + beakerWidth / 2;
+        let bTop = canvas.height / 2 - beakerHeight / 2;
+        let bBottom = canvas.height / 2 + beakerHeight / 2;
+
+        if (!p.outsideBeaker) {
+          // 왼쪽 벽
+          if (p.y >= bTop && p.y <= bBottom && p.x - particleRadius < bLeft) {
+            p.x = bLeft + particleRadius;
+            p.vx *= -0.5;
+          }
+          // 오른쪽 벽
+          if (p.y >= bTop && p.y <= bBottom && p.x + particleRadius > bRight) {
+            p.x = bRight - particleRadius;
+            p.vx *= -0.5;
+          }
+          // 하단 벽
+          if (p.x >= bLeft && p.x <= bRight && p.y + particleRadius > bBottom) {
+            p.y = bBottom - particleRadius;
+            p.vy *= -0.5;
+          }
+
+          // 비커 범위를 완전히 벗어났으면 outsideBeaker = true
+          if (
+            p.x < (bLeft - particleRadius) ||
+            p.x > (bRight + particleRadius) ||
+            p.y > (bBottom + particleRadius)
+          ) {
+            p.outsideBeaker = true;
+          }
+        }
+      }
+      
+      // 5) XSPH Velocity Smoothing
+      const xsphEpsilon = 0.5;
+      for (let i = 0; i < particles.length; i++) {
+        let p = particles[i];
+        let deltaVX = 0, deltaVY = 0;
+
+        const neighbors = neighborLists[i];
+        for (let j = 0; j < neighbors.length; j++) {
+          let q = neighbors[j];
+          let dx = p.x - q.x;
+          let dy = p.y - q.y;
+          let r2 = dx * dx + dy * dy;
+          if (r2 < h2) {
+            let r = Math.sqrt(r2);
+            let weight = poly6Kernel(r);
+            deltaVX += (q.mass / q.density) * (q.vx - p.vx) * weight;
+            deltaVY += (q.mass / q.density) * (q.vy - p.vy) * weight;
+          }
+        }
+        p.vx += xsphEpsilon * deltaVX;
+        p.vy += xsphEpsilon * deltaVY;
+      }
+
+      // ----- 화면 밖(양 옆·바닥)으로 나간 입자 제거 -----
+      particles = particles.filter(p => {
+        // 비커 안인 경우나 아직 outsideBeaker=false이면 그냥 유지
+        if (!p.outsideBeaker) return true;
+        // 이미 비커 밖이라면, 양옆 화면끝이나 화면 바닥에 닿았는지 검사
+        if (
+          p.x <= particleRadius ||
+          p.x >= canvas.width - particleRadius ||
+          p.y >= canvas.height - particleRadius
+        ) {
+          return false; // 제거
+        }
+        return true; // 그 외엔 유지
+      });
+    }
+
+    // 화면에 입자 및 비커 그리기
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // 입자 그리기
+      for (let p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, particleRadius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // 비커 그리기 (왼쪽, 오른쪽, 하단 벽)
+      ctx.strokeStyle = "#FFFFFF";
+      ctx.lineWidth = 2;
+      let bLeft = canvas.width / 2 - beakerWidth / 2;
+      let bRight = canvas.width / 2 + beakerWidth / 2;
+      let bTop = canvas.height / 2 - beakerHeight / 2;
+      let bBottom = canvas.height / 2 + beakerHeight / 2;
+      ctx.beginPath();
+      // 왼쪽 벽
+      ctx.moveTo(bLeft, bTop);
+      ctx.lineTo(bLeft, bBottom);
+      // 하단 벽
+      ctx.lineTo(bRight, bBottom);
+      // 오른쪽 벽
+      ctx.lineTo(bRight, bTop);
+      ctx.stroke();
+    }
+
+    // 메인 루프
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    // 창 크기 변경 시 캔버스 크기 업데이트
+    window.addEventListener("resize", () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    });
+
+    // 마우스 인터랙션: 클릭/드래그 시 선택된 유체 입자 생성
+    let isMouseDown = false;
+    canvas.addEventListener("mousedown", (e) => {
+      isMouseDown = true;
+      addParticles(e.clientX, e.clientY);
+    });
+    canvas.addEventListener("mouseup", () => {
+      isMouseDown = false;
+    });
+    canvas.addEventListener("mousemove", (e) => {
+      if (isMouseDown) {
+        addParticles(e.clientX, e.clientY);
+      }
+    });
+
+    // 지정 위치에 다수의 입자 추가 (클러스터 형태)
+    function addParticles(x, y) {
+      const fluidIndex = parseInt(fluidSelect.value);
+      for (let i = 0; i < 5; i++) {
+        const offsetX = (Math.random() - 0.5) * 10;
+        const offsetY = (Math.random() - 0.5) * 10;
+        particles.push(new Particle(x + offsetX, y + offsetY, fluidIndex));
+      }
+    }
+  </script>
+</body>
+</html>

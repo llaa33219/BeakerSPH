@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>SPH 기반 다중 유체 시뮬레이션</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+    }
+    canvas {
+      display: block;
+      background: #111;
+    }
+    /* (KISS, DRY: 스타일은 최소한으로) */
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+  "use strict";
+
+  // =============================================================================
+  // 문제 분석 (5WH Framework)
+  // -----------------------------------------------------------------------------
+  // What: SPH 기반의 다중 유체 시뮬레이션 (모든 입자가 SPH 방식이며, 물질들이 모두 유체)
+  // Why: 다양한 유체간 현실적인 상호작용 및 물리 기반 시뮬레이션 구현
+  // Who: 시뮬레이션 및 인터랙티브 데모를 원하는 사용자/개발자
+  // Where: HTML5 Canvas를 사용하는 웹 브라우저
+  // When: 페이지 로드 후 실시간 애니메이션으로 실행
+  // How: JavaScript + HTML5 Canvas, Uniform Grid 최적화를 통한 SPH 알고리즘 적용
+  //
+  // [Edge Case 식별]
+  // 1. 캔버스 경계 충돌 (입자가 경계에 도달 시 올바른 반사 처리)
+  // 2. 고밀도 영역에서의 안정성 (너무 많은 입자가 한곳에 몰릴 때)
+  // 3. 유체 타입 간 상호작용 (서로 다른 물리적 특성에 따른 힘 계산)
+  // 4. 단일 입자 (이웃이 전혀 없는 경우)로 인한 0 밀도 문제
+  // 5. 성능 문제 (입자 수 증가 시 O(n²) 연산 → Uniform Grid 최적화)
+  //
+  // [시간-공간 복잡도]
+  // - 시간 복잡도: Uniform Grid 적용 전 O(n²), 적용 후 약 O(n)
+  // - 공간 복잡도: O(n) (입자 저장 및 공간 분할 자료구조)
+  //
+  // =============================================================================
+  // 솔루션 설계 단계
+  // -----------------------------------------------------------------------------
+  // [패턴 매칭]
+  // - The Powder Toy, Fluid Simulation with SPH, HTML5 Particle System
+  //
+  // [아키텍처 선택]
+  // - Array: 입자 저장 (단순 구현)
+  // - Uniform Grid (객체/hash map): 인접 입자 탐색 최적화
+  //
+  // [Trade-off 분석]
+  // - 단순 Array: 구현이 간단하지만 입자 수가 많아지면 성능 문제 발생
+  // - Uniform Grid: 약간의 복잡도 증가, CPU 사이클 및 메모리 할당 관점에서 효율적
+  //
+  // =============================================================================
+  // 개발자 설계 의사결정 (Conscious Competence)
+  // -----------------------------------------------------------------------------
+  // - 문제 분석 → 자료구조 선택 → SPH 알고리즘 구현 → 최적화 및 성능 검증
+  // - MIT/Stanford 강의 자료, 실제 프로덕션 사례 및 GitHub Copilot, CodeWhisperer,
+  //   Cursor, SourceGraph 등 신규 AI 코딩 도구 활용
+  //
+  // 참고 링크 (원본 그대로):
+  // https://en.wikipedia.org/wiki/Smoothed-particle_hydrodynamics
+  // https://www.thepowdertoy.co.uk/
+  // https://sandspiel.club/
+  // =============================================================================
+
+  // ===================== Global Simulation Parameters =====================
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  const dt = 0.005;                   // 시간 간격
+  const smoothingRadius = 20;         // SPH smoothing length (h)
+  const particleMass = 1;             // 입자 질량 (단위: 임의)
+  const gravity = 400;                // 중력 (스케일 조정)
+  const cellSize = smoothingRadius;   // Uniform Grid 셀 크기
+
+  // SPH Kernel 상수 (Poly6, Spiky Gradient, Viscosity Laplacian)
+  const poly6Constant = 315 / (64 * Math.PI * Math.pow(smoothingRadius, 9));
+  const spikyGradientConstant = -45 / (Math.PI * Math.pow(smoothingRadius, 6));
+  const viscosityLaplacianConstant = 45 / (Math.PI * Math.pow(smoothingRadius, 6));
+
+  // ===================== Fluid Type Definitions =====================
+  // (여러 유체 타입을 정의하여 현실적인 상호작용 구현)
+  const fluidTypes = [
+    { name: "Water",   color: "#3399ff", restDensity: 1000, viscosity: 0.1,  stiffness: 2000 },
+    { name: "Oil",     color: "#cc6600", restDensity: 900,  viscosity: 0.2,  stiffness: 1500 },
+    { name: "Mercury", color: "#aaaaaa", restDensity: 13546, viscosity: 0.05, stiffness: 3000 },
+    { name: "Lava",    color: "#ff3300", restDensity: 2500, viscosity: 2.0,  stiffness: 1000 },
+    { name: "Acid",    color: "#66ff33", restDensity: 1100, viscosity: 0.15, stiffness: 1800 },
+    { name: "Honey",   color: "#ffcc00", restDensity: 1400, viscosity: 3.0,  stiffness: 2500 },
+    { name: "Milk",    color: "#ffffff", restDensity: 1030, viscosity: 0.1,  stiffness: 2000 }
+  ];
+
+  // ===================== Particle Class (SOLID: 단일 책임 원칙 적용) =====================
+  class Particle {
+    constructor(x, y, fluid) {
+      this.x = x;
+      this.y = y;
+      this.vx = 0;
+      this.vy = 0;
+      this.ax = 0;
+      this.ay = 0;
+      this.density = 0;
+      this.pressure = 0;
+      this.fluid = fluid; // 유체 타입 객체
+    }
+  }
+
+  // ===================== Simulation State =====================
+  let particles = [];
+  let grid = {};
+
+  // ===================== Uniform Grid Functions (DRY) =====================
+  function buildSpatialGrid() {
+    grid = {}; // grid 초기화
+    for (let p of particles) {
+      let cellX = Math.floor(p.x / cellSize);
+      let cellY = Math.floor(p.y / cellSize);
+      let key = cellX + "," + cellY;
+      if (!grid[key]) grid[key] = [];
+      grid[key].push(p);
+    }
+  }
+
+  function getNeighbors(particle) {
+    let neighbors = [];
+    let cellX = Math.floor(particle.x / cellSize);
+    let cellY = Math.floor(particle.y / cellSize);
+    for (let i = -1; i <= 1; i++) {
+      for (let j = -1; j <= 1; j++) {
+        let key = (cellX + i) + "," + (cellY + j);
+        if (grid[key]) {
+          neighbors = neighbors.concat(grid[key]);
+        }
+      }
+    }
+    return neighbors;
+  }
+
+  // ===================== SPH Simulation Functions =====================
+  // [Clean Code: SOLID, KISS, DRY 적용]
+  function computeDensityAndPressure() {
+    for (let p of particles) {
+      p.density = 0;
+      let neighbors = getNeighbors(p);
+      for (let np of neighbors) {
+        let dx = p.x - np.x;
+        let dy = p.y - np.y;
+        let r2 = dx * dx + dy * dy;
+        if (r2 < smoothingRadius * smoothingRadius) {
+          let r = Math.sqrt(r2);
+          // Poly6 Kernel (밀도 기여)
+          p.density += particleMass * poly6Constant * Math.pow(smoothingRadius * smoothingRadius - r2, 3);
+        }
+      }
+      // 만약 밀도가 0에 가까우면 안전하게 기본 밀도로 보정 (동시성/예외 처리)
+      if (p.density < 1e-6) {
+        p.density = p.fluid.restDensity;
+      }
+      // Pressure 계산 (상태 방정식: stiffness * (density - restDensity))
+      p.pressure = p.fluid.stiffness * (p.density - p.fluid.restDensity);
+    }
+  }
+
+  function computeForces() {
+    for (let p of particles) {
+      let pressureForceX = 0;
+      let pressureForceY = 0;
+      let viscosityForceX = 0;
+      let viscosityForceY = 0;
+      let neighbors = getNeighbors(p);
+      for (let np of neighbors) {
+        if (p === np) continue;
+        let dx = p.x - np.x;
+        let dy = p.y - np.y;
+        let r2 = dx * dx + dy * dy;
+        if (r2 < smoothingRadius * smoothingRadius && r2 > 0) {
+          let r = Math.sqrt(r2);
+          // Spiky kernel gradient
+          let grad = spikyGradientConstant * Math.pow(smoothingRadius - r, 2) / r;
+          // 압력 힘 (양쪽 입자의 압력을 고려)
+          let pressureTerm = (p.pressure + np.pressure) / (2 * np.density);
+          pressureForceX += -particleMass * pressureTerm * grad * dx;
+          pressureForceY += -particleMass * pressureTerm * grad * dy;
+          // 점성 힘
+          let laplacian = viscosityLaplacianConstant * (smoothingRadius - r);
+          viscosityForceX += p.fluid.viscosity * particleMass * (np.vx - p.vx) / np.density * laplacian;
+          viscosityForceY += p.fluid.viscosity * particleMass * (np.vy - p.vy) / np.density * laplacian;
+        }
+      }
+      // 중력 힘 (단순 상수 중력)
+      let gravityForceY = gravity;
+      // 가속도 계산 (Force / density)
+      p.ax = (pressureForceX + viscosityForceX) / p.density;
+      p.ay = (pressureForceY + viscosityForceY) / p.density + gravityForceY;
+    }
+  }
+
+  function integrate() {
+    for (let p of particles) {
+      // Euler integration (단순 구현)
+      p.vx += p.ax * dt;
+      p.vy += p.ay * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      // 경계 충돌 처리 (KISS: 단순 반사)
+      if (p.x < 0) { p.x = 0; p.vx *= -0.5; }
+      if (p.x > canvas.width) { p.x = canvas.width; p.vx *= -0.5; }
+      if (p.y < 0) { p.y = 0; p.vy *= -0.5; }
+      if (p.y > canvas.height) { p.y = canvas.height; p.vy *= -0.5; }
+    }
+  }
+
+  // ===================== Rendering Function =====================
+  function render() {
+    // 캔버스 초기화
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (let p of particles) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
+      ctx.fillStyle = p.fluid.color;
+      ctx.fill();
+    }
+    // (선택적) FPS 표시: 성능 벤치마크 용
+    ctx.fillStyle = "#fff";
+    ctx.font = "12px Arial";
+    ctx.fillText("FPS: " + fps, 10, 20);
+  }
+
+  // ===================== Performance Monitor (FPS) =====================
+  let lastTimestamp = performance.now();
+  let frameCount = 0;
+  let fps = 0;
+  function updateFPS(timestamp) {
+    frameCount++;
+    if (timestamp - lastTimestamp >= 1000) {
+      fps = frameCount;
+      frameCount = 0;
+      lastTimestamp = timestamp;
+      // 콘솔에도 출력 (옵션)
+      console.log("FPS:", fps);
+    }
+  }
+
+  // ===================== Main Simulation Loop =====================
+  function step(timestamp) {
+    try {
+      updateFPS(timestamp);
+      buildSpatialGrid();
+      computeDensityAndPressure();
+      computeForces();
+      integrate();
+      render();
+    } catch (e) {
+      console.error("Simulation Error: ", e);
+    }
+    requestAnimationFrame(step);
+  }
+
+  // ===================== Particle Spawning Functions =====================
+  // 클릭 및 마우스 이동 시 입자 생성 (유저 인터랙션)
+  function spawnParticles(x, y, count = 50) {
+    for (let i = 0; i < count; i++) {
+      // 약간의 랜덤 분포
+      let px = x + (Math.random() - 0.5) * 10;
+      let py = y + (Math.random() - 0.5) * 10;
+      // fluidTypes 배열에서 랜덤 선택
+      let fluid = fluidTypes[Math.floor(Math.random() * fluidTypes.length)];
+      particles.push(new Particle(px, py, fluid));
+    }
+  }
+
+  canvas.addEventListener("mousedown", function(e) {
+    spawnParticles(e.clientX, e.clientY, 100);
+  });
+  canvas.addEventListener("mousemove", function(e) {
+    if (e.buttons === 1) { // 마우스 좌클릭 유지 시 지속 생성
+      spawnParticles(e.clientX, e.clientY, 5);
+    }
+  });
+
+  // ===================== 초기 입자 생성 (초기 상태) =====================
+  // 화면 상단 영역에 무작위 분포로 입자 생성
+  for (let i = 0; i < 300; i++) {
+    let x = Math.random() * canvas.width;
+    let y = Math.random() * (canvas.height / 4);
+    let fluid = fluidTypes[Math.floor(Math.random() * fluidTypes.length)];
+    particles.push(new Particle(x, y, fluid));
+  }
+
+  // ===================== Start Simulation =====================
+  requestAnimationFrame(step);
+
+  // ===================== Window Resize Handling =====================
+  window.addEventListener("resize", () => {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  });
+</script>
+</body>
+</html>
